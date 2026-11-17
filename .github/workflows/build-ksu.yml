@@ -1,0 +1,120 @@
+name: build-ksu
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc gcc-aarch64-linux-gnu bc bison flex libssl-dev xz-utils unzip zip
+
+      - name: Fetch inputs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/in
+          gh release download v1-src --repo ${{ github.repository }} -p 'kheaders.tar' -p 'KSU-mainline-patched.zip' -p 'Module.symvers' -D /tmp/in
+          ls -lh /tmp/in
+
+      - name: Fetch mainline 4.19.152 scaffold
+        run: |
+          curl -fL --retry 3 -o /tmp/k.tar.xz https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.19.152.tar.xz
+          tar -xf /tmp/k.tar.xz -C /tmp
+          mv /tmp/linux-4.19.152 /tmp/ktree
+
+      - name: Overlay exact device headers (kheaders)
+        run: |
+          cd /tmp
+          mkdir -p kh && tar -xf /tmp/in/kheaders.tar -C kh
+          # kheaders 是构建该内核时导出的精确头文件，覆盖主线头文件
+          cp -a kh/include/. /tmp/ktree/include/
+          cp -a kh/arch/arm64/include/. /tmp/ktree/arch/arm64/include/
+          echo "UTS: $(cat /tmp/ktree/include/generated/utsrelease.h)"
+          grep -E 'CONFIG_(MODVERSIONS|SCHED_WALT)' /tmp/ktree/include/generated/autoconf.h
+
+      - name: Configure with device config
+        run: |
+          cd /tmp/ktree
+          cp "$GITHUB_WORKSPACE/configs/config_981.txt" .config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig >/dev/null 2>&1 || true
+          echo "=== after olddefconfig ==="
+          grep -E 'CONFIG_(MODVERSIONS|MODULE_SIG_FORCE|SCHED_WALT|LOCALVERSION|SECURITY_SELINUX)=' .config
+
+      - name: modules_prepare
+        run: |
+          cd /tmp/ktree
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc) KCFLAGS="-Wno-error" 2>&1 | tail -10
+
+      - name: Generate SELinux flask headers
+        run: |
+          cd /tmp/ktree
+          # 先编译 host 工具 genheaders（make scripts 会产出 scripts/selinux/genheaders/genheaders）
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_SECURITY_SELINUX=y \
+               scripts >/dev/null 2>&1 || true
+          GH_BIN=$(ls scripts/selinux/genheaders/genheaders 2>/dev/null || true)
+          if [ -x "$GH_BIN" ]; then
+            echo "using built genheaders: $GH_BIN"
+            "$GH_BIN" security/selinux/flask.h security/selinux/av_permissions.h
+          else
+            echo "!!! genheaders binary missing, try make target"
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_SECURITY_SELINUX=y \
+                 security/selinux/flask.h security/selinux/av_permissions.h 2>&1 | tail -10 || true
+          fi
+          ls -l security/selinux/flask.h security/selinux/av_permissions.h
+
+      - name: Restore exact generated headers (kheaders wins)
+        run: |
+          cd /tmp
+          cp -f kh/include/generated/autoconf.h /tmp/ktree/include/generated/autoconf.h
+          cp -f kh/include/generated/utsrelease.h /tmp/ktree/include/generated/utsrelease.h
+          cp -f kh/include/generated/asm-offsets.h /tmp/ktree/include/generated/asm-offsets.h 2>/dev/null || true
+          cp -f kh/include/generated/bounds.h /tmp/ktree/include/generated/bounds.h 2>/dev/null || true
+          cat /tmp/ktree/include/generated/utsrelease.h
+
+      - name: Build kernelsu.ko
+        run: |
+          cd /tmp
+          rm -rf ksu && mkdir ksu && unzip -q /tmp/in/KSU-mainline-patched.zip -d ksu
+          # kernel/uapi 在仓库中是符号链接，GitHub 归档不保留，手动补上
+          mkdir -p ksu/kernel/uapi && cp -a ksu/uapi/. ksu/kernel/uapi/
+          cp /tmp/in/Module.symvers /tmp/ktree/Module.symvers
+          make -C /tmp/ktree ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               M=/tmp/ksu/kernel src=/tmp/ksu/kernel \
+               CONFIG_KSU=m CONFIG_KPM=n \
+               KBUILD_MODPOST_WARN=1 KCFLAGS="-Wno-error" \
+               modules -j$(nproc) 2>&1 | tee /tmp/build.log
+          RC=${PIPESTATUS[0]}
+          echo "--- build.log tail ---"
+          tail -40 /tmp/build.log
+          if [ $RC -ne 0 ] || [ ! -f /tmp/ksu/kernel/kernelsu.ko ]; then
+            echo "!!! kernelsu.ko NOT produced (rc=$RC)"
+            exit 1
+          fi
+
+      - name: Inspect module
+        run: |
+          ls -l /tmp/ksu/kernel/kernelsu.ko || true
+          if [ -f /tmp/ksu/kernel/kernelsu.ko ]; then
+            echo "=== vermagic ==="
+            aarch64-linux-gnu-objdump -s -j .modinfo /tmp/ksu/kernel/kernelsu.ko | head -30
+            echo "=== undefined symbols (should not include kallsyms_*) ==="
+            aarch64-linux-gnu-nm -u /tmp/ksu/kernel/kernelsu.ko | head -40
+            echo "=== size ==="
+            ls -lh /tmp/ksu/kernel/kernelsu.ko
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-ko
+          path: /tmp/ksu/kernel/kernelsu.ko
+          if-no-files-found: warn
